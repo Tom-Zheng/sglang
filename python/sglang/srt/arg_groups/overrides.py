@@ -1952,6 +1952,14 @@ def _page_size_default(view: Any) -> dict:
     if view.page_size is not None:
         return {}
 
+    resolved_prefill_backend = view.prefill_attention_backend or view.attention_backend
+    if (
+        resolved_prefill_backend == "flashinfer"
+        and view.flashinfer_prefill_backend == "cute-dsl-prims"
+    ):
+        logger.info("Setting page_size=64 for FlashInfer backend='cute-dsl-prims'.")
+        return {"page_size": 64}
+
     # SHUFFLE 5D vectorized KV layout (aiter backend + pa_decode_gluon)
     # is tuned for and prefers page_size=64 — making it the default
     # when the layout flag is set avoids users having to pass
@@ -1968,6 +1976,44 @@ def _page_size_default(view: Any) -> dict:
     if not is_musa():
         return {"page_size": 1}
     return {"page_size": 64}
+
+
+@register_post_process
+def _flashinfer_prims_validation(view: Any) -> dict:
+    if view.flashinfer_prefill_backend != "cute-dsl-prims":
+        return {}
+    resolved_prefill_backend = view.prefill_attention_backend or view.attention_backend
+    if resolved_prefill_backend != "flashinfer":
+        raise ValueError(
+            "--flashinfer-prefill-backend cute-dsl-prims requires the resolved "
+            f"prefill attention backend to be flashinfer; got {resolved_prefill_backend!r}"
+        )
+    if view.page_size not in (16, 32, 64, 128):
+        raise ValueError(
+            "--flashinfer-prefill-backend cute-dsl-prims requires --page-size "
+            f"in {{16, 32, 64, 128}}; got {view.page_size}"
+        )
+    if view.kv_cache_dtype not in ("fp8_e4m3", "float8_e4m3fn"):
+        raise ValueError(
+            "--flashinfer-prefill-backend cute-dsl-prims requires "
+            f"--kv-cache-dtype fp8_e4m3; got {view.kv_cache_dtype!r}"
+        )
+    if view.speculative_algorithm is not None:
+        raise ValueError(
+            "--flashinfer-prefill-backend cute-dsl-prims does not support "
+            "speculative verify/draft"
+        )
+    if view.enable_mis:
+        raise ValueError(
+            "--flashinfer-prefill-backend cute-dsl-prims does not support "
+            "multi-item scoring or custom attention masks"
+        )
+    if view.enable_deterministic_inference:
+        raise ValueError(
+            "--flashinfer-prefill-backend cute-dsl-prims does not support "
+            "deterministic fixed-split prefill"
+        )
+    return {}
 
 
 @register_post_process

@@ -62,6 +62,7 @@ _TRITON_KERNELS = [
     ("cache_ops", "concat_and_cast_mha_k_triton"),
     ("cache_ops", "launch_reshape_and_cache_flash"),
     ("kv_indices", "create_flashinfer_kv_indices_triton"),
+    ("kv_indices", "create_flashinfer_page_indices_triton"),
     ("kv_indices", "create_flashmla_kv_indices_triton"),
     ("kv_indices", "create_chunked_prefix_cache_kv_indices"),
     ("kv_indices", "get_num_kv_index_blocks_flashmla"),

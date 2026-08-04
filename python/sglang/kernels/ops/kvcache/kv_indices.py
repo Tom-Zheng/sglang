@@ -45,6 +45,50 @@ def create_flashinfer_kv_indices_triton(
 
 
 @triton.jit
+def create_flashinfer_page_indices_triton(
+    req_to_token_ptr,
+    req_pool_indices_ptr,
+    page_kernel_lens_ptr,
+    page_indptr,
+    kv_start_idx,
+    page_indices_ptr,
+    req_to_token_ptr_stride: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+):
+    """Build page-granularity FlashInfer indices from token slot metadata."""
+    BLOCK_SIZE: tl.constexpr = 128
+    pid = tl.program_id(axis=0)
+    req_pool_index = tl.load(req_pool_indices_ptr + pid)
+    out_offset = tl.load(page_indptr + pid)
+    kv_len = tl.load(page_kernel_lens_ptr + pid).to(tl.int32)
+    kv_start = 0
+    if kv_start_idx:
+        kv_start = tl.load(kv_start_idx + pid).to(tl.int32)
+    num_pages = tl.cdiv(kv_len, PAGE_SIZE)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    for block in range(tl.cdiv(num_pages, BLOCK_SIZE)):
+        logical_page = block * BLOCK_SIZE + offsets
+        mask = logical_page < num_pages
+        token_loc = tl.load(
+            req_to_token_ptr
+            + req_pool_index * req_to_token_ptr_stride
+            + kv_start
+            + logical_page * PAGE_SIZE,
+            mask=mask,
+            other=0,
+        )
+        tl.device_assert(
+            token_loc % PAGE_SIZE == 0,
+            "FlashInfer PRIMS requires page-aligned KV allocations",
+        )
+        tl.store(
+            page_indices_ptr + out_offset + logical_page,
+            token_loc // PAGE_SIZE,
+            mask=mask,
+        )
+
+
+@triton.jit
 def create_chunked_prefix_cache_kv_indices(
     req_to_token_ptr,  # (max_batch, max_context_len,)
     req_pool_indices_ptr,  # (batch_size,)

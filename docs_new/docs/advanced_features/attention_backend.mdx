@@ -12,6 +12,47 @@ Selecting an optimal attention backend is crucial for maximizing your performanc
 If you don't specify `--attention-backend`, SGLang makes a best effort to automatically select the most performant backend based on your hardware and model architecture.
 </Warning>
 
+## FlashInfer SM120 FP8 prefill
+
+On NVIDIA SM120 GPUs, you can keep FlashInfer as the top-level attention
+backend while selecting its PRIMS CuTe-DSL implementation for prefill:
+
+```bash
+python -m sglang.launch_server \
+  --model-path MODEL_PATH \
+  --attention-backend flashinfer \
+  --flashinfer-prefill-backend cute-dsl-prims \
+  --kv-cache-dtype fp8_e4m3 \
+  --page-size 64 \
+  --cuda-graph-backend-prefill disabled
+```
+
+This configuration uses `cute-dsl-prims` for full-attention prefill and keeps
+FlashInfer FA2 for decode. Hybrid models continue to use their configured
+linear-attention backend for linear-attention layers.
+
+<Info>
+If you omit `--page-size`, SGLang selects 64 for this configuration. The
+supported page sizes are 16, 32, 64, and 128.
+</Info>
+
+The initial integration requires:
+
+- An NVIDIA GPU with compute capability 12.0.
+- FlashInfer built with the CuTe-DSL stack that provides
+  `cutlass.experimental`.
+- FP8 E4M3 KV cache and NHD page-major K/V storage.
+- Full attention without sliding windows, custom masks, attention soft caps,
+  attention sinks, multi-item scoring, deterministic fixed-split prefill,
+  speculative verification, or prefill CUDA Graph capture.
+
+Decode CUDA Graph remains supported. Disable only the prefill phase as shown
+above.
+
+The `--flashinfer-prefill-backend` option is not a top-level attention
+backend. Do not pass `cute-dsl-prims` to `--attention-backend` or
+`--prefill-attention-backend`; it has no decode kernel.
+
 ## Support Matrix
 
 The support matrix is split into two parts: MHA (standard attention) and MLA (multi-head latent attention). For an explanation of the key differences between MHA and MLA, please see the [SGLang documentation on DeepSeek MLA](/cookbook/autoregressive/DeepSeek/DeepSeek-V3#4-2-4-mla-optimizations) and the original [DeepSeek MLA paper](https://arxiv.org/pdf/2405.04434).

@@ -1644,6 +1644,16 @@ class ServerArgs:
         ),
         NS("exec.kernel"),
     ] = None
+    flashinfer_prefill_backend: A[
+        Optional[str],
+        Arg(
+            help="Select the FlashInfer prefill wrapper implementation. This is "
+            "only effective when the resolved prefill attention backend is "
+            "flashinfer.",
+            choices=["fa2", "cute-dsl-prims"],
+        ),
+        NS("exec.kernel"),
+    ] = None
     sampling_backend: A[
         Optional[str],
         Arg(
@@ -5785,11 +5795,13 @@ class ServerArgs:
         # Moved to the resolution pipeline (arg_groups/overrides.py:
         # _page_size_default), invoked here at its legacy slot.
         from sglang.srt.arg_groups.overrides import (
+            _flashinfer_prims_validation,
             _page_size_default,
             run_post_process_pass,
         )
 
         run_post_process_pass(self, _page_size_default)
+        run_post_process_pass(self, _flashinfer_prims_validation)
 
     def _handle_amd_specifics(self):
         if is_hip():

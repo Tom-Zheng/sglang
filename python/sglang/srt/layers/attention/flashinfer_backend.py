@@ -22,6 +22,7 @@ from sglang.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
+    create_flashinfer_page_indices_triton,
 )
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
@@ -309,7 +310,10 @@ class FlashInferAttnBackend(AttentionBackend):
         init_new_workspace: bool = False,
     ):
         super().__init__()
-        self.prefill_backend = "fa2"
+        self.flashinfer_prefill_backend = (
+            model_runner.server_args.flashinfer_prefill_backend
+        )
+        self.prefill_backend = self.flashinfer_prefill_backend or "fa2"
         self.decode_backend = "fa2"
 
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -378,6 +382,78 @@ class FlashInferAttnBackend(AttentionBackend):
         )
         self.max_context_len = model_runner.model_config.context_len
         self.page_size = model_runner.page_size
+        self.use_prims_prefill = self.prefill_backend == "cute-dsl-prims"
+        if self.use_prims_prefill:
+            server_args = model_runner.server_args
+            capability = torch.cuda.get_device_capability(model_runner.device)
+            if capability != (12, 0):
+                raise ValueError(
+                    "--flashinfer-prefill-backend cute-dsl-prims requires SM120; "
+                    f"got compute capability {capability[0]}.{capability[1]}"
+                )
+            if model_runner.kv_cache_dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    "--flashinfer-prefill-backend cute-dsl-prims requires "
+                    f"FP8 E4M3 KV cache; got {model_runner.kv_cache_dtype}"
+                )
+            if self.page_size not in (16, 32, 64, 128):
+                raise ValueError(
+                    "--flashinfer-prefill-backend cute-dsl-prims requires "
+                    f"page size 16/32/64/128; got {self.page_size}"
+                )
+            if (
+                self.use_sliding_window_kv_pool
+                or model_runner.model_config.is_encoder_decoder
+            ):
+                raise ValueError(
+                    "--flashinfer-prefill-backend cute-dsl-prims does not support "
+                    "sliding-window or cross attention"
+                )
+            if server_args.speculative_algorithm is not None:
+                raise ValueError(
+                    "--flashinfer-prefill-backend cute-dsl-prims does not support "
+                    "speculative verify/draft"
+                )
+            if server_args.enable_mis:
+                raise ValueError(
+                    "--flashinfer-prefill-backend cute-dsl-prims does not support "
+                    "multi-item scoring or custom attention masks"
+                )
+            if server_args.enable_deterministic_inference:
+                raise ValueError(
+                    "--flashinfer-prefill-backend cute-dsl-prims does not support "
+                    "deterministic fixed-split prefill"
+                )
+            if not check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
+                raise ValueError(
+                    "--flashinfer-prefill-backend cute-dsl-prims does not support "
+                    "prefill CUDA Graph; disable only prefill graph capture"
+                )
+            if model_runner.model_config.has_attention_sinks:
+                raise ValueError(
+                    "--flashinfer-prefill-backend cute-dsl-prims does not support "
+                    "attention sinks"
+                )
+            prims_token_capacity = server_args.max_prefill_tokens
+            prims_q_heads = (
+                model_runner.model_config.num_attention_heads
+                // get_parallel().attn_tp_size
+            )
+            prims_kv_heads = model_runner.model_config.get_num_kv_heads(
+                get_parallel().attn_tp_size
+            )
+            prims_head_dim = model_runner.model_config.head_dim
+            self._prims_q_buffer = torch.empty(
+                prims_token_capacity * prims_q_heads * prims_head_dim,
+                dtype=torch.float8_e4m3fn,
+                device=model_runner.device,
+            )
+            self._prims_k_buffer = torch.empty(
+                prims_token_capacity * prims_kv_heads * prims_head_dim,
+                dtype=torch.float8_e4m3fn,
+                device=model_runner.device,
+            )
+            self._prims_v_buffer = torch.empty_like(self._prims_k_buffer)
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
         assert not (
@@ -477,14 +553,22 @@ class FlashInferAttnBackend(AttentionBackend):
                 for _ in range(self.num_wrappers)
             ]
 
-        fmha_backend = "auto"
-        if is_sm100_supported():
+        fmha_backend = self.prefill_backend if self.use_prims_prefill else "auto"
+        if is_sm100_supported() and not self.use_prims_prefill:
             # Disable CUTLASS backend when piecewise cuda graph is enabled
             # due to TMA descriptor initialization issues on SM100 GPUs.
             if not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
                 fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
+        )
+        logger.info(
+            "FlashInfer attention resolved prefill sub-backend=%s, "
+            "decode backend=%s, KV dtype=%s, layout=NHD, page_size=%d",
+            self.prefill_backend,
+            self.decode_backend,
+            self.flashinfer_kv_cache_dtype,
+            self.page_size,
         )
 
         # Two wrappers: one for sliding window attention and one for full attention.
@@ -1268,8 +1352,17 @@ class FlashInferAttnBackend(AttentionBackend):
         )
 
         logits_soft_cap = layer.logit_cap
+        if self.use_prims_prefill and logits_soft_cap > 0:
+            raise ValueError(
+                "--flashinfer-prefill-backend cute-dsl-prims does not support "
+                f"attention logits soft cap; got {logits_soft_cap}"
+            )
 
-        q = q.contiguous()
+        cache_k_input, cache_v_input = k, v
+        if self.use_prims_prefill:
+            q, k, v = self._prepare_prims_qkv(q, k, v, layer)
+        else:
+            q = q.contiguous()
 
         assert not (
             self.prefill_uses_dequant_workspace and layer.is_cross_attention
@@ -1292,6 +1385,22 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             kv_cache = pool.get_kv_buffer(layer.layer_id)
+        if self.use_prims_prefill:
+            k_pool, v_pool = kv_cache
+            kv_cache = (
+                k_pool.view(
+                    -1,
+                    self.page_size,
+                    layer.tp_k_head_num,
+                    layer.head_dim,
+                ),
+                v_pool.view(
+                    -1,
+                    self.page_size,
+                    layer.tp_v_head_num,
+                    layer.head_dim,
+                ),
+            )
 
         # use paged attention
         if not self.forward_metadata.use_ragged:
@@ -1300,8 +1409,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
                     KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
-                    k,
-                    v,
+                    cache_k_input,
+                    cache_v_input,
                     *self._kv_write_scales(layer),
                 )
 
@@ -1309,30 +1418,40 @@ class FlashInferAttnBackend(AttentionBackend):
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
             )
-            o = prefill_wrapper_paged.forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                kv_cache,
-                causal=causal,
-                sm_scale=layer.scaling,
-                # Disable sliding window attention for multi-item scoring:
-                # - Sliding window could cut across item boundaries, breaking semantic coherence
-                # - Multi-item sequences need full attention to properly handle delimiter tokens
-                # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
-                #   provide more precise attention control than simple sliding windows
-                # - Item-aware masking takes precedence over window-based masking
-                window_left=(
-                    layer.sliding_window_size
-                    if not (
-                        self.forward_metadata.multi_item_params
-                        and self.forward_metadata.multi_item_params.is_enabled()
-                    )
-                    else -1
-                ),
-                logits_soft_cap=logits_soft_cap,
-                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
-            )
+            paged_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            if self.use_prims_prefill:
+                o = prefill_wrapper_paged.run(
+                    paged_q,
+                    kv_cache,
+                    q_scale=1.0,
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                )
+            else:
+                o = prefill_wrapper_paged.forward(
+                    paged_q,
+                    kv_cache,
+                    causal=causal,
+                    sm_scale=layer.scaling,
+                    # Disable sliding window attention for multi-item scoring:
+                    # - Sliding window could cut across item boundaries, breaking semantic coherence
+                    # - Multi-item sequences need full attention to properly handle delimiter tokens
+                    # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
+                    #   provide more precise attention control than simple sliding windows
+                    # - Item-aware masking takes precedence over window-based masking
+                    window_left=(
+                        layer.sliding_window_size
+                        if not (
+                            self.forward_metadata.multi_item_params
+                            and self.forward_metadata.multi_item_params.is_enabled()
+                        )
+                        else -1
+                    ),
+                    logits_soft_cap=logits_soft_cap,
+                    # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                )
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
             # `self.token_to_kv_pool` for this layer. This enables attention over
@@ -1357,14 +1476,27 @@ class FlashInferAttnBackend(AttentionBackend):
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
                 # https://github.com/flashinfer-ai/flashinfer/issues/1048
-                o = self.prefill_wrapper_ragged.forward(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                    causal=causal,
-                    sm_scale=layer.scaling,
-                    logits_soft_cap=logits_soft_cap,
-                )
+                ragged_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                ragged_k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
+                ragged_v = v.view(-1, layer.tp_v_head_num, layer.head_dim)
+                if self.use_prims_prefill:
+                    o = self.prefill_wrapper_ragged.run(
+                        ragged_q,
+                        ragged_k,
+                        ragged_v,
+                        q_scale=1.0,
+                        k_scale=layer.k_scale_float,
+                        v_scale=layer.v_scale_float,
+                    )
+                else:
+                    o = self.prefill_wrapper_ragged.forward(
+                        ragged_q,
+                        ragged_k,
+                        ragged_v,
+                        causal=causal,
+                        sm_scale=layer.scaling,
+                        logits_soft_cap=logits_soft_cap,
+                    )
 
             else:
                 swa_window_left = (
@@ -1375,23 +1507,43 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
                     else -1
                 )
-                o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                    causal=causal,
-                    sm_scale=layer.scaling,
-                    window_left=swa_window_left,
-                    logits_soft_cap=logits_soft_cap,
-                )
-                o2, s2 = prefill_wrapper_paged.forward_return_lse(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    kv_cache,
-                    causal=False,
-                    sm_scale=layer.scaling,
-                    window_left=swa_window_left,
-                    logits_soft_cap=logits_soft_cap,
-                )
+                ragged_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                ragged_k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
+                ragged_v = v.view(-1, layer.tp_v_head_num, layer.head_dim)
+                if self.use_prims_prefill:
+                    o1, s1 = self.prefill_wrapper_ragged.run_return_lse(
+                        ragged_q,
+                        ragged_k,
+                        ragged_v,
+                        q_scale=1.0,
+                        k_scale=layer.k_scale_float,
+                        v_scale=layer.v_scale_float,
+                    )
+                    o2, s2 = prefill_wrapper_paged.run_return_lse(
+                        ragged_q,
+                        kv_cache,
+                        q_scale=1.0,
+                        k_scale=layer.k_scale_float,
+                        v_scale=layer.v_scale_float,
+                    )
+                else:
+                    o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
+                        ragged_q,
+                        ragged_k,
+                        ragged_v,
+                        causal=causal,
+                        sm_scale=layer.scaling,
+                        window_left=swa_window_left,
+                        logits_soft_cap=logits_soft_cap,
+                    )
+                    o2, s2 = prefill_wrapper_paged.forward_return_lse(
+                        ragged_q,
+                        kv_cache,
+                        causal=False,
+                        sm_scale=layer.scaling,
+                        window_left=swa_window_left,
+                        logits_soft_cap=logits_soft_cap,
+                    )
 
                 o, _ = _safe_merge_state(o1, s1, o2, s2)
 
@@ -1399,12 +1551,50 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
                     KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
-                    k,
-                    v,
+                    cache_k_input,
+                    cache_v_input,
                     *self._kv_write_scales(layer),
                 )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def _prepare_prims_qkv(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        layer: RadixAttention,
+    ):
+        """Cast BF16 activations into reusable FP8 prefill buffers."""
+
+        def convert(
+            name: str,
+            source: torch.Tensor,
+            buffer: torch.Tensor,
+            scale: float = 1.0,
+        ) -> torch.Tensor:
+            assert_buffer_fits(
+                source.numel(),
+                buffer.numel(),
+                f"cute-dsl-prims {name} conversion buffer",
+            )
+            target = buffer[: source.numel()].view(source.shape)
+            if scale == 1.0:
+                target.copy_(source)
+            else:
+                torch.mul(source, 1.0 / scale, out=target)
+            return target
+
+        q_fp8 = convert("Q", q, self._prims_q_buffer)
+        if k is None:
+            if v is not None:
+                raise ValueError("cute-dsl-prims requires K and V together")
+            return q_fp8, None, None
+        if v is None:
+            raise ValueError("cute-dsl-prims requires K and V together")
+        k_fp8 = convert("K", k, self._prims_k_buffer, layer.k_scale_float or 1.0)
+        v_fp8 = convert("V", v, self._prims_v_buffer, layer.v_scale_float or 1.0)
+        return q_fp8, k_fp8, v_fp8
 
     @debug_kernel_api
     def forward_decode(
@@ -1756,7 +1946,11 @@ class FlashInferIndicesUpdaterPrefill:
         )
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = attn_backend.flashinfer_kv_cache_dtype
-        self.q_data_type = model_runner.dtype
+        self.q_data_type = (
+            torch.float8_e4m3fn
+            if attn_backend.use_prims_prefill
+            else model_runner.dtype
+        )
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
         # Buffers and wrappers
@@ -1841,6 +2035,7 @@ class FlashInferIndicesUpdaterPrefill:
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
             seq_lens_cpu=seq_lens_cpu,
+            prefix_lens_cpu=extend_prefix_lens_cpu,
             custom_kv_indices=custom_kv_indices,
         )
 
@@ -2050,6 +2245,7 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         seq_lens_cpu: Optional[torch.Tensor] = None,
+        prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
         window_left: int = -1,
     ):
@@ -2060,7 +2256,42 @@ class FlashInferIndicesUpdaterPrefill:
             # Normal extend
             # custom_kv_indices uses exact dq_paged_kernel_lens so FlashInfer causal
             # offsets are based on real token counts, not page-aligned padding.
-            if (
+            if self.attn_backend.use_prims_prefill:
+                if custom_kv_indices is not None:
+                    raise NotImplementedError(
+                        "cute-dsl-prims does not support custom KV indices"
+                    )
+                page_counts = torch.div(
+                    paged_kernel_lens + self.attn_backend.page_size - 1,
+                    self.attn_backend.page_size,
+                    rounding_mode="floor",
+                ).to(torch.int32)
+                kv_indptr[1 : bs + 1] = torch.cumsum(page_counts, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+                max_page_count = (
+                    paged_kernel_lens_sum + self.attn_backend.page_size - 1
+                ) // self.attn_backend.page_size + bs
+                kv_indices = torch.empty(
+                    max_page_count + 256,
+                    dtype=torch.int32,
+                    device=req_pool_indices.device,
+                )
+                create_flashinfer_page_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    kv_indptr,
+                    kv_start_idx,
+                    kv_indices,
+                    self.req_to_token.shape[1],
+                    PAGE_SIZE=self.attn_backend.page_size,
+                )
+                self.kv_last_page_len[:bs] = torch.where(
+                    paged_kernel_lens > 0,
+                    (paged_kernel_lens - 1) % self.attn_backend.page_size + 1,
+                    self.attn_backend.page_size,
+                ).to(torch.int32)
+            elif (
                 custom_kv_indices is not None
                 and self.attn_backend.dq_paged_kernel_lens is not None
             ):
@@ -2071,7 +2302,10 @@ class FlashInferIndicesUpdaterPrefill:
                 kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
 
-            if custom_kv_indices is not None:
+            if self.attn_backend.use_prims_prefill:
+                # The page-granularity table was populated above.
+                pass
+            elif custom_kv_indices is not None:
                 kv_indices = custom_kv_indices
             else:
                 kv_indices = torch.empty(
@@ -2114,6 +2348,53 @@ class FlashInferIndicesUpdaterPrefill:
                     )
                 )
 
+        prims_qo_indptr_host = None
+        prims_ragged_plan_kwargs = {}
+        prims_paged_plan_kwargs = {}
+        if self.attn_backend.use_prims_prefill:
+            if seq_lens_cpu is None or prefix_lens_cpu is None:
+                raise ValueError(
+                    "cute-dsl-prims requires host-known seq_lens_cpu and "
+                    "extend_prefix_lens_cpu; refusing a device-to-host fallback"
+                )
+            if seq_lens_cpu.device.type != "cpu":
+                raise ValueError(
+                    "cute-dsl-prims requires seq_lens_cpu on CPU; refusing a "
+                    "device-to-host fallback"
+                )
+            seq_lens_host = seq_lens_cpu.to(dtype=torch.int32)
+            prefix_lens_host = torch.tensor(prefix_lens_cpu, dtype=torch.int32)
+            if len(seq_lens_host) != bs or len(prefix_lens_host) != bs:
+                raise ValueError(
+                    "cute-dsl-prims host length metadata must match batch size "
+                    f"{bs}; got seq={len(seq_lens_host)}, "
+                    f"prefix={len(prefix_lens_host)}"
+                )
+            q_lens_host = seq_lens_host - prefix_lens_host
+            prims_qo_indptr_host = torch.zeros(bs + 1, dtype=torch.int32)
+            prims_qo_indptr_host[1:] = torch.cumsum(q_lens_host, dim=0)
+            prims_ragged_plan_kwargs = dict(
+                qo_indptr_host=prims_qo_indptr_host,
+                kv_indptr_host=prims_qo_indptr_host,
+            )
+            paged_kv_lens_host = prefix_lens_host if use_ragged else seq_lens_host
+            page_counts_host = (
+                paged_kv_lens_host + self.attn_backend.page_size - 1
+            ) // self.attn_backend.page_size
+            paged_kv_indptr_host = torch.zeros(bs + 1, dtype=torch.int32)
+            paged_kv_indptr_host[1:] = torch.cumsum(page_counts_host, dim=0)
+            last_page_len_host = torch.where(
+                paged_kv_lens_host > 0,
+                (paged_kv_lens_host - 1) % self.attn_backend.page_size + 1,
+                self.attn_backend.page_size,
+            )
+            prims_paged_plan_kwargs = dict(
+                qo_indptr_host=prims_qo_indptr_host,
+                paged_kv_indptr_host=paged_kv_indptr_host,
+                paged_kv_last_page_len_host=last_page_len_host,
+                kv_lens_host=paged_kv_lens_host,
+            )
+
         # extend part
         if use_ragged:
             wrapper_ragged.begin_forward(
@@ -2122,7 +2403,13 @@ class FlashInferIndicesUpdaterPrefill:
                 self.num_qo_heads,
                 self.num_kv_heads,
                 self.head_dim,
+                causal=True,
                 q_data_type=self.q_data_type,
+                kv_data_type=self.q_data_type,
+                o_data_type=(
+                    torch.bfloat16 if self.attn_backend.use_prims_prefill else None
+                ),
+                **prims_ragged_plan_kwargs,
             )
 
         if use_sliding_window_kv_pool:
@@ -2154,7 +2441,7 @@ class FlashInferIndicesUpdaterPrefill:
         # fast_prefill_plan (installed at capture) is sync-free: it needs the
         # host-known qo/kv layout from the caller. Assert rather than silently
         # fall back to plan()'s blocking D2H on the replay hot-path.
-        paged_plan_kwargs = {}
+        paged_plan_kwargs = dict(prims_paged_plan_kwargs)
         num_tokens_per_req = (
             spec_info.num_tokens_per_req if spec_info is not None else None
         )
@@ -2199,9 +2486,13 @@ class FlashInferIndicesUpdaterPrefill:
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
-            1,
+            self.attn_backend.page_size if self.attn_backend.use_prims_prefill else 1,
+            causal=not use_ragged,
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
+            o_data_type=(
+                torch.bfloat16 if self.attn_backend.use_prims_prefill else None
+            ),
             custom_mask=use_custom_mask,
             non_blocking=True,
             fixed_split_size=fixed_split_size,

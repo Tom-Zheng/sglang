@@ -37,6 +37,9 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashinfer_kv_indices_triton as create_flashinfer_kv_indices_triton,
 )
 from sglang.kernels.ops.kvcache.kv_indices import (
+    create_flashinfer_page_indices_triton as create_flashinfer_page_indices_triton,
+)
+from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashmla_kv_indices_triton as create_flashmla_kv_indices_triton,
 )
 from sglang.kernels.ops.kvcache.kv_indices import (
